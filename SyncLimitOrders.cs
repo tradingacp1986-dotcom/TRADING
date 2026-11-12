@@ -3,7 +3,10 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using NinjaTrader.Cbi;
 using NinjaTrader.Gui;
 using NinjaTrader.Gui.Tools;
@@ -54,6 +57,10 @@ namespace NinjaTrader.NinjaScript.Indicators
         private readonly Dictionary<Order, Order> contraOf = new Dictionary<Order, Order>();
         private readonly Dictionary<Order, Order> originalOf = new Dictionary<Order, Order>();
         private const string ContraName = "SyncContra";
+
+        // Clave pública de la licencia (la privada solo la tiene el autor, en el generador de claves)
+        private const string LicensePublicKey = "<RSAKeyValue><Modulus>1lSNzOfNdXkEYiNkZ2M6EgfzVhHg36iGja7LLUvNOYh92xYpFuJHqHbEEEWN5HCDNq5jtjbEJklfWw6RexfTnHqF8+7JmhU5Oa4LdHwmyO/QAmO5YqYrwJP2yXMIhhlDMWi7gJhaQ08fLTRI5yJLWQd51gVxHIPz4Hz3+ZE6II/fmx1wrrQXjdRrTfVYEtMZfzzlnaNpDblJ8x/p+o3oltqYlQaylIsuVQdzuxuUkBVzfn8UzTdcGaEqbUPO6G9/KsC0VC7vDogg1N5gOImtzu01ooGaKgCMvZj6seQNtuJ6yn+eLMBh7+blUGSvpgUGNlpQqzOvgLmVvUW5yRet9w==</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>";
+        private const string LicenseFileName = "SyncLimitOrders.lic";
         // Firmas de las contrarias que acabamos de enviar (evita que una contraria genere otra contraria)
         private readonly List<string> pendingContra = new List<string>();
 
@@ -70,9 +77,13 @@ namespace NinjaTrader.NinjaScript.Indicators
                 UseStopPrice    = true;
                 CreateOpposite  = true;
                 UseChartTraderAtm = true;
+                LicenseKey      = string.Empty;
             }
             else if (State == State.DataLoaded)
             {
+                if (!CheckLicense())
+                    return;
+
                 lock (Account.All)
                 {
                     accA = Account.All.FirstOrDefault(a => a.Name == AccountA);
@@ -105,6 +116,64 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (accB != null) accB.OrderUpdate -= OnOrderUpdate;
             }
         }
+
+        #region Licencia
+        private static string GetMachineId()
+        {
+            return (NinjaTrader.Cbi.License.MachineId ?? string.Empty).Trim().ToUpperInvariant();
+        }
+
+        // La clave es la firma RSA de "SyncLimitOrders|<Machine ID>": solo vale en ese ordenador
+        private static bool IsValidKey(string key, string machineId)
+        {
+            if (string.IsNullOrWhiteSpace(key) || string.IsNullOrEmpty(machineId))
+                return false;
+
+            try
+            {
+                byte[] signature = Convert.FromBase64String(key.Trim());
+                byte[] data = Encoding.UTF8.GetBytes("SyncLimitOrders|" + machineId);
+
+                using (RSACryptoServiceProvider rsa = new RSACryptoServiceProvider())
+                {
+                    rsa.PersistKeyInCsp = false;
+                    rsa.FromXmlString(LicensePublicKey);
+                    return rsa.VerifyData(data, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                }
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        // Acepta la clave del parámetro o la del archivo SyncLimitOrders.lic de la carpeta de NinjaTrader 8
+        private bool CheckLicense()
+        {
+            string machineId = GetMachineId();
+            string file = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, LicenseFileName);
+
+            if (IsValidKey(LicenseKey, machineId))
+            {
+                // Se guarda para no tener que pegarla cada vez
+                try { File.WriteAllText(file, LicenseKey.Trim()); } catch (Exception) { }
+                return true;
+            }
+
+            try
+            {
+                if (File.Exists(file) && IsValidKey(File.ReadAllText(file), machineId))
+                    return true;
+            }
+            catch (Exception) { }
+
+            string msg = "SyncLimitOrders: licencia no válida para este ordenador. El indicador NO está funcionando. "
+                + "Envía este Machine ID al autor para recibir tu clave: " + machineId;
+            Print(msg);
+            Log(msg, LogLevel.Error);
+            return false;
+        }
+        #endregion
 
         #region Helpers
         private static bool IsLive(OrderState s)
@@ -520,6 +589,9 @@ namespace NinjaTrader.NinjaScript.Indicators
         [NinjaScriptProperty]
         [Display(Name = "Contraria con ATM y contratos del Chart Trader", Description = "Activo: la orden contraria se envía con la estrategia ATM y la cantidad de contratos del Chart Trader del gráfico que tiene elegida la cuenta destino. Si no hay gráfico con esa cuenta, se envía sin ATM y con la cantidad de la orden original. Desactivado: sin ATM y con la misma cantidad que la original.", Order = 5, GroupName = "Parámetros")]
         public bool UseChartTraderAtm { get; set; }
+
+        [Display(Name = "Clave de licencia", Description = "Pega aquí la clave que te dio el autor. Solo hace falta la primera vez: queda guardada en este ordenador.", Order = 1, GroupName = "Licencia")]
+        public string LicenseKey { get; set; }
         #endregion
     }
 }
