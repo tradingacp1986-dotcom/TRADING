@@ -5,6 +5,8 @@ using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using System.Linq;
 using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Tools;
 using NinjaTrader.Gui.NinjaScript;
 #endregion
 
@@ -52,6 +54,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         private readonly Dictionary<Order, Order> contraOf = new Dictionary<Order, Order>();
         private readonly Dictionary<Order, Order> originalOf = new Dictionary<Order, Order>();
         private const string ContraName = "SyncContra";
+        // Firmas de las contrarias que acabamos de enviar (evita que una contraria genere otra contraria)
+        private readonly List<string> pendingContra = new List<string>();
 
         protected override void OnStateChange()
         {
@@ -65,6 +69,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 AccountB        = "Sim102";
                 UseStopPrice    = true;
                 CreateOpposite  = true;
+                UseChartTraderAtm = true;
             }
             else if (State == State.DataLoaded)
             {
@@ -147,6 +152,37 @@ namespace NinjaTrader.NinjaScript.Indicators
             return true; // sin posición abierta, toda orden es una entrada
         }
 
+        private string Signature(Account acc, OrderAction action, OrderType type, int quantity, double limitPrice, double stopPrice)
+        {
+            double tick = Instrument.MasterInstrument.TickSize;
+            bool buys = action == OrderAction.Buy || action == OrderAction.BuyToCover;
+            return acc.Name + "|" + (buys ? "B" : "S") + "|" + type + "|" + quantity
+                + "|" + (long)Math.Round(limitPrice / tick) + "|" + (long)Math.Round(stopPrice / tick);
+        }
+
+        // Nombre de la plantilla ATM seleccionada en el Chart Trader de este gráfico (null si no hay ninguna).
+        // Debe llamarse desde el hilo de la interfaz.
+        private string GetChartTraderAtm()
+        {
+            if (ChartControl == null)
+                return null;
+
+            System.Windows.Window window = System.Windows.Window.GetWindow(ChartControl.Parent);
+            if (window == null)
+                return null;
+
+            NinjaTrader.Gui.NinjaScript.AtmStrategy.AtmStrategySelector selector =
+                window.FindFirst("ChartTraderControlATMStrategySelector") as NinjaTrader.Gui.NinjaScript.AtmStrategy.AtmStrategySelector;
+            if (selector == null)
+                return null;
+
+            NinjaTrader.NinjaScript.AtmStrategy atm = selector.SelectedAtmStrategy;
+            if (atm == null || string.IsNullOrEmpty(atm.Template))
+                return null;
+
+            return atm.Template;
+        }
+
         private void SeedExistingOrders(Account acc)
         {
             lock (acc.Orders)
@@ -183,6 +219,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         {
                             lastLevel.Remove(order.OrderId);
                             handled.Remove(order);
+                            pendingContra.Remove(Signature((Account)sender, order.OrderAction, order.OrderType, e.Quantity, e.LimitPrice, e.StopPrice));
 
                             Order other;
                             if (contraOf.TryGetValue(order, out other))
@@ -218,6 +255,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 double newLevel = LevelOf(order.OrderType, e.LimitPrice, e.StopPrice);
                 bool changed;
                 bool isNew;
+                bool isOurContra;
                 Order partner;
 
                 lock (sync)
@@ -230,12 +268,19 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                     if (!contraOf.TryGetValue(order, out partner))
                         originalOf.TryGetValue(order, out partner);
+
+                    // ¿Es una contraria que acabamos de enviar nosotros?
+                    isOurContra = pendingContra.Remove(Signature(source, order.OrderAction, order.OrderType, e.Quantity, e.LimitPrice, e.StopPrice))
+                        || originalOf.ContainsKey(order)
+                        || order.Name == ContraName;
                 }
 
-                // Orden Limit nueva puesta por el usuario -> crear la StopLimit contraria en la otra cuenta
-                if (isNew && CreateOpposite && order.OrderType == OrderType.Limit && order.Name != ContraName)
+                // Orden nueva puesta por el usuario -> crear la contraria en la otra cuenta:
+                // Limit -> StopLimit contraria; StopLimit -> Limit contraria
+                if (isNew && CreateOpposite && !isOurContra)
                 {
-                    SubmitOpposite(target, order, e.LimitPrice, e.Quantity);
+                    OrderType contraType = order.OrderType == OrderType.Limit ? OrderType.StopLimit : OrderType.Limit;
+                    SubmitOpposite(target, order, contraType, newLevel, e.Quantity);
                     return;
                 }
 
@@ -257,25 +302,61 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
-        // Crea en la otra cuenta una StopLimit de sentido contrario, al mismo precio y con la misma cantidad
-        private void SubmitOpposite(Account target, Order original, double price, int quantity)
+        // Crea en la otra cuenta una orden de sentido contrario, al mismo precio y con la misma cantidad
+        private void SubmitOpposite(Account target, Order original, OrderType contraType, double price, int quantity)
         {
             price = Instrument.MasterInstrument.RoundToTickSize(price);
 
             bool originalBuys = original.OrderAction == OrderAction.Buy || original.OrderAction == OrderAction.BuyToCover;
             OrderAction action = originalBuys ? OrderAction.Sell : OrderAction.Buy;
 
-            Order contra = target.CreateOrder(original.Instrument, action, OrderType.StopLimit, OrderEntry.Manual,
-                original.TimeInForce, quantity, price, price, string.Empty, ContraName, Core.Globals.MaxDate, null);
+            double limitPrice = price;
+            double stopPrice  = contraType == OrderType.StopLimit ? price : 0;
+
+            if (UseChartTraderAtm && ChartControl != null)
+            {
+                // El ATM seleccionado en el Chart Trader solo se puede leer desde el hilo de la interfaz
+                ChartControl.Dispatcher.InvokeAsync((Action)(() =>
+                {
+                    try
+                    {
+                        SendOpposite(target, original, action, contraType, quantity, limitPrice, stopPrice, GetChartTraderAtm());
+                    }
+                    catch (Exception ex)
+                    {
+                        Print("SyncLimitOrders error al enviar la contraria: " + ex.Message);
+                    }
+                }));
+            }
+            else
+                SendOpposite(target, original, action, contraType, quantity, limitPrice, stopPrice, null);
+        }
+
+        private void SendOpposite(Account target, Order original, OrderAction action, OrderType contraType,
+            int quantity, double limitPrice, double stopPrice, string atmTemplate)
+        {
+            // Si la original ya no está viva (se canceló mientras tanto), no se envía nada
+            if (!IsLive(original.OrderState))
+                return;
+
+            bool withAtm = !string.IsNullOrEmpty(atmTemplate);
+
+            // Para que NinjaTrader arranque un ATM, la orden de entrada debe llamarse "Entry"
+            Order contra = target.CreateOrder(original.Instrument, action, contraType, OrderEntry.Manual,
+                original.TimeInForce, quantity, limitPrice, stopPrice, string.Empty, withAtm ? "Entry" : ContraName, Core.Globals.MaxDate, null);
 
             lock (sync)
             {
                 handled.Add(contra);
                 contraOf[original] = contra;
                 originalOf[contra] = original;
+                pendingContra.Add(Signature(target, action, contraType, quantity, limitPrice, stopPrice));
             }
 
-            target.Submit(new[] { contra });
+            if (withAtm)
+                NinjaTrader.NinjaScript.AtmStrategy.StartAtmStrategy(atmTemplate, contra);
+            else
+                target.Submit(new[] { contra });
         }
 
         private void MirrorToTarget(Account target, Order sourceOrder, double level)
@@ -351,8 +432,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public bool UseStopPrice { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Crear orden contraria", Description = "Activo: al poner una orden Limit en una cuenta se crea una StopLimit contraria, al mismo precio y cantidad, en la otra.", Order = 4, GroupName = "Parámetros")]
+        [Display(Name = "Crear orden contraria", Description = "Activo: una Limit nueva crea una StopLimit contraria en la otra cuenta, y una StopLimit nueva crea una Limit contraria, al mismo precio y cantidad.", Order = 4, GroupName = "Parámetros")]
         public bool CreateOpposite { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Contraria con el ATM del Chart Trader", Description = "Activo: la orden contraria se envía con la estrategia ATM seleccionada en el Chart Trader de este gráfico. Si no hay ninguna seleccionada, se envía sin ATM.", Order = 5, GroupName = "Parámetros")]
+        public bool UseChartTraderAtm { get; set; }
         #endregion
     }
 }
