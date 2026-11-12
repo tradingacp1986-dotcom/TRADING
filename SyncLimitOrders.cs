@@ -48,21 +48,23 @@ namespace NinjaTrader.NinjaScript.Indicators
     {
         private Account accA;
         private Account accB;
-        private readonly Dictionary<string, double> lastLevel = new Dictionary<string, double>();
-        private readonly object sync = new object();
+        // El estado es COMPARTIDO (static) entre todas las copias del indicador: así, aunque esté cargado en
+        // varios gráficos, cada orden se procesa una sola vez y una contraria nunca genera otra contraria.
+        private static readonly Dictionary<string, double> lastLevel = new Dictionary<string, double>();
+        private static readonly object sync = new object();
 
         // Órdenes ya vistas (para no crear la contraria dos veces)
-        private readonly HashSet<Order> handled = new HashSet<Order>();
+        private static readonly HashSet<Order> handled = new HashSet<Order>();
         // original -> contraria, y contraria -> original
-        private readonly Dictionary<Order, Order> contraOf = new Dictionary<Order, Order>();
-        private readonly Dictionary<Order, Order> originalOf = new Dictionary<Order, Order>();
+        private static readonly Dictionary<Order, Order> contraOf = new Dictionary<Order, Order>();
+        private static readonly Dictionary<Order, Order> originalOf = new Dictionary<Order, Order>();
         private const string ContraName = "SyncContra";
 
         // Clave pública de la licencia (la privada solo la tiene el autor, en el generador de claves)
         private const string LicensePublicKey = "<RSAKeyValue><Modulus>1lSNzOfNdXkEYiNkZ2M6EgfzVhHg36iGja7LLUvNOYh92xYpFuJHqHbEEEWN5HCDNq5jtjbEJklfWw6RexfTnHqF8+7JmhU5Oa4LdHwmyO/QAmO5YqYrwJP2yXMIhhlDMWi7gJhaQ08fLTRI5yJLWQd51gVxHIPz4Hz3+ZE6II/fmx1wrrQXjdRrTfVYEtMZfzzlnaNpDblJ8x/p+o3oltqYlQaylIsuVQdzuxuUkBVzfn8UzTdcGaEqbUPO6G9/KsC0VC7vDogg1N5gOImtzu01ooGaKgCMvZj6seQNtuJ6yn+eLMBh7+blUGSvpgUGNlpQqzOvgLmVvUW5yRet9w==</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>";
         private const string LicenseFileName = "SyncLimitOrders.lic";
         // Firmas de las contrarias que acabamos de enviar (evita que una contraria genere otra contraria)
-        private readonly List<string> pendingContra = new List<string>();
+        private static readonly List<string> pendingContra = new List<string>();
 
         protected override void OnStateChange()
         {
@@ -225,7 +227,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             double tick = Instrument.MasterInstrument.TickSize;
             bool buys = action == OrderAction.Buy || action == OrderAction.BuyToCover;
-            return acc.Name + "|" + (buys ? "B" : "S") + "|" + type + "|" + quantity
+            return acc.Name + "|" + Instrument.FullName + "|" + (buys ? "B" : "S") + "|" + type + "|" + quantity
                 + "|" + (long)Math.Round(limitPrice / tick) + "|" + (long)Math.Round(stopPrice / tick);
         }
 
@@ -320,7 +322,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                     lock (sync) handled.Add(o);
 
                     if (IsSyncType(o) && IsLive(o.OrderState) && IsEntry(acc, o))
-                        lock (sync) lastLevel[o.OrderId] = LevelOf(o.OrderType, o.LimitPrice, o.StopPrice);
+                        lock (sync)
+                        {
+                            if (!lastLevel.ContainsKey(o.OrderId))
+                                lastLevel[o.OrderId] = LevelOf(o.OrderType, o.LimitPrice, o.StopPrice);
+                        }
                 }
             }
         }
