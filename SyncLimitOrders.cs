@@ -160,11 +160,13 @@ namespace NinjaTrader.NinjaScript.Indicators
                 + "|" + (long)Math.Round(limitPrice / tick) + "|" + (long)Math.Round(stopPrice / tick);
         }
 
-        // Nombre de la plantilla ATM seleccionada en el Chart Trader del gráfico que tiene elegida la cuenta indicada
-        // (mismo instrumento). Devuelve null si no hay gráfico con esa cuenta o no tiene ATM seleccionado.
+        // Lee el Chart Trader del gráfico que tiene elegida la cuenta indicada (mismo instrumento):
+        // devuelve el nombre de la plantilla ATM seleccionada (null si no hay) y, en "quantity", sus contratos
+        // (0 si no hay gráfico con esa cuenta).
         // NO debe llamarse desde el hilo de la interfaz ni desde un evento de órdenes: consulta cada ventana en su propio hilo.
-        private string GetChartTraderAtm(Account account)
+        private string GetChartTraderAtm(Account account, out int quantity)
         {
+            quantity = 0;
             List<System.Windows.Window> windows;
             try
             {
@@ -186,6 +188,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 try
                 {
                     bool accountFound = false;
+                    int chartQuantity = 0;
 
                     string template = (string)chart.Dispatcher.Invoke(new Func<string>(() =>
                     {
@@ -202,6 +205,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                         accountFound = true;
 
+                        // Contratos puestos en ese Chart Trader
+                        NinjaTrader.Gui.Tools.QuantityUpDown qtySel =
+                            chart.FindFirst("ChartTraderControlQuantitySelector") as NinjaTrader.Gui.Tools.QuantityUpDown;
+                        if (qtySel != null)
+                            chartQuantity = qtySel.Value;
+
                         NinjaTrader.Gui.NinjaScript.AtmStrategy.AtmStrategySelector atmSel =
                             chart.FindFirst("ChartTraderControlATMStrategySelector") as NinjaTrader.Gui.NinjaScript.AtmStrategy.AtmStrategySelector;
                         if (atmSel == null)
@@ -216,7 +225,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                     // El primer gráfico que tenga esa cuenta decide (con o sin ATM)
                     if (accountFound)
+                    {
+                        quantity = chartQuantity;
                         return template;
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -225,7 +237,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
 
             Print("SyncLimitOrders: no hay ningún gráfico de " + instrumentName + " con la cuenta " + account.Name
-                + " en su Chart Trader; la contraria se envía sin ATM.");
+                + " en su Chart Trader; la contraria se envía sin ATM y con la cantidad de la orden original.");
             return null;
         }
 
@@ -348,7 +360,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
-        // Crea en la otra cuenta una orden de sentido contrario, al mismo precio y con la misma cantidad
+        // Crea en la otra cuenta una orden de sentido contrario al mismo precio, con el ATM y los contratos
+        // del Chart Trader de esa otra cuenta
         private void SubmitOpposite(Account target, Order original, OrderType contraType, double price, int quantity)
         {
             price = Instrument.MasterInstrument.RoundToTickSize(price);
@@ -371,13 +384,17 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 try
                 {
-                    string atmTemplate = GetChartTraderAtm(target);
+                    int chartQuantity;
+                    string atmTemplate = GetChartTraderAtm(target, out chartQuantity);
+
+                    // Contratos del Chart Trader de la cuenta destino; si no se pudieron leer, los de la orden original
+                    int contraQuantity = chartQuantity > 0 ? chartQuantity : quantity;
 
                     Action send = () =>
                     {
                         try
                         {
-                            SendOpposite(target, original, action, contraType, quantity, limitPrice, stopPrice, atmTemplate);
+                            SendOpposite(target, original, action, contraType, contraQuantity, limitPrice, stopPrice, atmTemplate);
                         }
                         catch (Exception ex)
                         {
@@ -497,11 +514,11 @@ namespace NinjaTrader.NinjaScript.Indicators
         public bool UseStopPrice { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Crear orden contraria", Description = "Activo: una Limit nueva crea una StopLimit contraria en la otra cuenta, y una StopLimit nueva crea una Limit contraria, al mismo precio y cantidad.", Order = 4, GroupName = "Parámetros")]
+        [Display(Name = "Crear orden contraria", Description = "Activo: una Limit nueva crea una StopLimit contraria en la otra cuenta, y una StopLimit nueva crea una Limit contraria, al mismo precio.", Order = 4, GroupName = "Parámetros")]
         public bool CreateOpposite { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Contraria con el ATM del Chart Trader", Description = "Activo: la orden contraria se envía con la estrategia ATM seleccionada en el Chart Trader del gráfico que tiene elegida la cuenta destino. Si no hay gráfico con esa cuenta o no tiene ATM seleccionado, se envía sin ATM.", Order = 5, GroupName = "Parámetros")]
+        [Display(Name = "Contraria con ATM y contratos del Chart Trader", Description = "Activo: la orden contraria se envía con la estrategia ATM y la cantidad de contratos del Chart Trader del gráfico que tiene elegida la cuenta destino. Si no hay gráfico con esa cuenta, se envía sin ATM y con la cantidad de la orden original. Desactivado: sin ATM y con la misma cantidad que la original.", Order = 5, GroupName = "Parámetros")]
         public bool UseChartTraderAtm { get; set; }
         #endregion
     }
