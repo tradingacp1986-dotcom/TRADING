@@ -46,17 +46,25 @@ namespace NinjaTrader.NinjaScript.Indicators
         private readonly Dictionary<string, double> lastLevel = new Dictionary<string, double>();
         private readonly object sync = new object();
 
+        // Órdenes ya vistas (para no crear la contraria dos veces)
+        private readonly HashSet<Order> handled = new HashSet<Order>();
+        // original -> contraria, y contraria -> original
+        private readonly Dictionary<Order, Order> contraOf = new Dictionary<Order, Order>();
+        private readonly Dictionary<Order, Order> originalOf = new Dictionary<Order, Order>();
+        private const string ContraName = "SyncContra";
+
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
             {
                 Name            = "SyncLimitOrders";
-                Description     = "Sincroniza el nivel de órdenes Limit y StopLimit entre dos cuentas";
+                Description     = "Crea la orden StopLimit contraria en la otra cuenta y sincroniza el nivel entre ambas";
                 Calculate       = Calculate.OnBarClose;
                 IsOverlay       = true;
                 AccountA        = "Sim101";
                 AccountB        = "Sim102";
                 UseStopPrice    = true;
+                CreateOpposite  = true;
             }
             else if (State == State.DataLoaded)
             {
@@ -69,6 +77,14 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (accA == null || accB == null)
                 {
                     Log("SyncLimitOrders: no se encontró una de las cuentas.", LogLevel.Error);
+                    return;
+                }
+
+                if (accA == accB)
+                {
+                    Log("SyncLimitOrders: Cuenta A y Cuenta B no pueden ser la misma.", LogLevel.Error);
+                    accA = null;
+                    accB = null;
                     return;
                 }
 
@@ -137,6 +153,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 foreach (Order o in acc.Orders)
                 {
+                    // Las órdenes que ya existían al cargar el indicador no generan contraria
+                    lock (sync) handled.Add(o);
+
                     if (IsSyncType(o) && IsLive(o.OrderState) && IsEntry(acc, o))
                         lock (sync) lastLevel[o.OrderId] = LevelOf(o.OrderType, o.LimitPrice, o.StopPrice);
                 }
@@ -158,11 +177,39 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (!IsLive(e.OrderState))
                 {
                     if (e.OrderState == OrderState.Filled || e.OrderState == OrderState.Cancelled || e.OrderState == OrderState.Rejected)
-                        lock (sync) lastLevel.Remove(order.OrderId);
+                    {
+                        Order contra = null;
+                        lock (sync)
+                        {
+                            lastLevel.Remove(order.OrderId);
+                            handled.Remove(order);
+
+                            Order other;
+                            if (contraOf.TryGetValue(order, out other))
+                            {
+                                // Terminó la original
+                                contraOf.Remove(order);
+                                originalOf.Remove(other);
+                                if (e.OrderState != OrderState.Filled)
+                                    contra = other;
+                            }
+                            else if (originalOf.TryGetValue(order, out other))
+                            {
+                                // Terminó la contraria: la original se queda como está
+                                originalOf.Remove(order);
+                                contraOf.Remove(other);
+                            }
+                        }
+
+                        // Original cancelada (o rechazada) -> se cancela también la contraria
+                        if (contra != null && IsLive(contra.OrderState))
+                            contra.Account.Cancel(new[] { contra });
+                    }
                     return;
                 }
 
                 Account source = (Account)sender;
+                Account target = source == accA ? accB : accA;
 
                 // Los stops y targets (y cualquier salida) no se sincronizan
                 if (!IsEntry(source, order))
@@ -170,24 +217,65 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                 double newLevel = LevelOf(order.OrderType, e.LimitPrice, e.StopPrice);
                 bool changed;
+                bool isNew;
+                Order partner;
 
                 lock (sync)
                 {
                     double old;
                     changed = lastLevel.TryGetValue(order.OrderId, out old) && Math.Abs(old - newLevel) > 1e-9;
                     lastLevel[order.OrderId] = newLevel;
+
+                    isNew = handled.Add(order);
+
+                    if (!contraOf.TryGetValue(order, out partner))
+                        originalOf.TryGetValue(order, out partner);
+                }
+
+                // Orden Limit nueva puesta por el usuario -> crear la StopLimit contraria en la otra cuenta
+                if (isNew && CreateOpposite && order.OrderType == OrderType.Limit && order.Name != ContraName)
+                {
+                    SubmitOpposite(target, order, e.LimitPrice, e.Quantity);
+                    return;
                 }
 
                 if (!changed)
                     return;
 
-                Account target = source == accA ? accB : accA;
-                MirrorToTarget(target, order, newLevel);
+                if (partner != null)
+                {
+                    // Orden emparejada: se mueve directamente su pareja
+                    if (IsLive(partner.OrderState))
+                        MoveOrder(partner, Instrument.MasterInstrument.RoundToTickSize(newLevel));
+                }
+                else
+                    MirrorToTarget(target, order, newLevel);
             }
             catch (Exception ex)
             {
                 Print("SyncLimitOrders error: " + ex.Message);
             }
+        }
+
+        // Crea en la otra cuenta una StopLimit de sentido contrario, al mismo precio y con la misma cantidad
+        private void SubmitOpposite(Account target, Order original, double price, int quantity)
+        {
+            price = Instrument.MasterInstrument.RoundToTickSize(price);
+
+            bool originalBuys = original.OrderAction == OrderAction.Buy || original.OrderAction == OrderAction.BuyToCover;
+            OrderAction action = originalBuys ? OrderAction.Sell : OrderAction.Buy;
+
+            Order contra = target.CreateOrder(original.Instrument, action, OrderType.StopLimit, OrderEntry.Manual,
+                original.TimeInForce, quantity, price, price, string.Empty, ContraName, Core.Globals.MaxDate, null);
+
+            lock (sync)
+            {
+                handled.Add(contra);
+                contraOf[original] = contra;
+                originalOf[contra] = original;
+            }
+
+            target.Submit(new[] { contra });
         }
 
         private void MirrorToTarget(Account target, Order sourceOrder, double level)
@@ -219,7 +307,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 return;
             }
 
-            Order t = matches[0];
+            MoveOrder(matches[0], level);
+        }
+
+        private void MoveOrder(Order t, double level)
+        {
             double currentLevel = LevelOf(t.OrderType, t.LimitPrice, t.StopPrice);
 
             if (Math.Abs(currentLevel - level) < 1e-9)
@@ -240,7 +332,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 t.LimitPriceChanged = level;
             }
 
-            target.Change(new[] { t });
+            t.Account.Change(new[] { t });
         }
 
         #region Properties
@@ -257,6 +349,10 @@ namespace NinjaTrader.NinjaScript.Indicators
         [NinjaScriptProperty]
         [Display(Name = "StopLimit: usar precio stop como nivel", Description = "Activo: el nivel de un StopLimit es su precio stop. Desactivado: es su precio límite.", Order = 3, GroupName = "Parámetros")]
         public bool UseStopPrice { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Crear orden contraria", Description = "Activo: al poner una orden Limit en una cuenta se crea una StopLimit contraria, al mismo precio y cantidad, en la otra.", Order = 4, GroupName = "Parámetros")]
+        public bool CreateOpposite { get; set; }
         #endregion
     }
 }
