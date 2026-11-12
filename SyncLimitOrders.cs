@@ -160,27 +160,73 @@ namespace NinjaTrader.NinjaScript.Indicators
                 + "|" + (long)Math.Round(limitPrice / tick) + "|" + (long)Math.Round(stopPrice / tick);
         }
 
-        // Nombre de la plantilla ATM seleccionada en el Chart Trader de este gráfico (null si no hay ninguna).
-        // Debe llamarse desde el hilo de la interfaz.
-        private string GetChartTraderAtm()
+        // Nombre de la plantilla ATM seleccionada en el Chart Trader del gráfico que tiene elegida la cuenta indicada
+        // (mismo instrumento). Devuelve null si no hay gráfico con esa cuenta o no tiene ATM seleccionado.
+        // NO debe llamarse desde el hilo de la interfaz ni desde un evento de órdenes: consulta cada ventana en su propio hilo.
+        private string GetChartTraderAtm(Account account)
         {
-            if (ChartControl == null)
+            List<System.Windows.Window> windows;
+            try
+            {
+                windows = NinjaTrader.Core.Globals.AllWindows.ToList();
+            }
+            catch (Exception)
+            {
                 return null;
+            }
 
-            System.Windows.Window window = System.Windows.Window.GetWindow(ChartControl.Parent);
-            if (window == null)
-                return null;
+            string instrumentName = Instrument.FullName;
 
-            NinjaTrader.Gui.NinjaScript.AtmStrategy.AtmStrategySelector selector =
-                window.FindFirst("ChartTraderControlATMStrategySelector") as NinjaTrader.Gui.NinjaScript.AtmStrategy.AtmStrategySelector;
-            if (selector == null)
-                return null;
+            foreach (System.Windows.Window w in windows)
+            {
+                NinjaTrader.Gui.Chart.Chart chart = w as NinjaTrader.Gui.Chart.Chart;
+                if (chart == null)
+                    continue;
 
-            NinjaTrader.NinjaScript.AtmStrategy atm = selector.SelectedAtmStrategy;
-            if (atm == null || string.IsNullOrEmpty(atm.Template))
-                return null;
+                try
+                {
+                    bool accountFound = false;
 
-            return atm.Template;
+                    string template = (string)chart.Dispatcher.Invoke(new Func<string>(() =>
+                    {
+                        // Solo gráficos del mismo instrumento
+                        NinjaTrader.Gui.Chart.ChartControl cc = chart.ActiveChartControl;
+                        if (cc != null && cc.Instrument != null && cc.Instrument.FullName != instrumentName)
+                            return null;
+
+                        // Solo el gráfico cuyo Chart Trader tiene seleccionada esta cuenta
+                        NinjaTrader.Gui.Tools.AccountSelector accSel =
+                            chart.FindFirst("ChartTraderControlAccountSelector") as NinjaTrader.Gui.Tools.AccountSelector;
+                        if (accSel == null || accSel.SelectedAccount == null || accSel.SelectedAccount.Name != account.Name)
+                            return null;
+
+                        accountFound = true;
+
+                        NinjaTrader.Gui.NinjaScript.AtmStrategy.AtmStrategySelector atmSel =
+                            chart.FindFirst("ChartTraderControlATMStrategySelector") as NinjaTrader.Gui.NinjaScript.AtmStrategy.AtmStrategySelector;
+                        if (atmSel == null)
+                            return null;
+
+                        NinjaTrader.NinjaScript.AtmStrategy atm = atmSel.SelectedAtmStrategy;
+                        if (atm == null || string.IsNullOrEmpty(atm.Template))
+                            return null;
+
+                        return atm.Template;
+                    }));
+
+                    // El primer gráfico que tenga esa cuenta decide (con o sin ATM)
+                    if (accountFound)
+                        return template;
+                }
+                catch (Exception ex)
+                {
+                    Print("SyncLimitOrders: no se pudo leer el Chart Trader de una ventana: " + ex.Message);
+                }
+            }
+
+            Print("SyncLimitOrders: no hay ningún gráfico de " + instrumentName + " con la cuenta " + account.Name
+                + " en su Chart Trader; la contraria se envía sin ATM.");
+            return null;
         }
 
         private void SeedExistingOrders(Account acc)
@@ -313,23 +359,42 @@ namespace NinjaTrader.NinjaScript.Indicators
             double limitPrice = price;
             double stopPrice  = contraType == OrderType.StopLimit ? price : 0;
 
-            if (UseChartTraderAtm && ChartControl != null)
+            if (!UseChartTraderAtm)
             {
-                // El ATM seleccionado en el Chart Trader solo se puede leer desde el hilo de la interfaz
-                ChartControl.Dispatcher.InvokeAsync((Action)(() =>
-                {
-                    try
-                    {
-                        SendOpposite(target, original, action, contraType, quantity, limitPrice, stopPrice, GetChartTraderAtm());
-                    }
-                    catch (Exception ex)
-                    {
-                        Print("SyncLimitOrders error al enviar la contraria: " + ex.Message);
-                    }
-                }));
-            }
-            else
                 SendOpposite(target, original, action, contraType, quantity, limitPrice, stopPrice, null);
+                return;
+            }
+
+            // El ATM se lee del Chart Trader del gráfico de la cuenta destino. Se hace fuera del evento de
+            // órdenes porque hay que consultar el hilo de la interfaz de cada ventana de gráfico.
+            System.Threading.ThreadPool.QueueUserWorkItem(state =>
+            {
+                try
+                {
+                    string atmTemplate = GetChartTraderAtm(target);
+
+                    Action send = () =>
+                    {
+                        try
+                        {
+                            SendOpposite(target, original, action, contraType, quantity, limitPrice, stopPrice, atmTemplate);
+                        }
+                        catch (Exception ex)
+                        {
+                            Print("SyncLimitOrders error al enviar la contraria: " + ex.Message);
+                        }
+                    };
+
+                    if (ChartControl != null)
+                        ChartControl.Dispatcher.InvokeAsync(send);
+                    else
+                        send();
+                }
+                catch (Exception ex)
+                {
+                    Print("SyncLimitOrders error al leer el ATM: " + ex.Message);
+                }
+            });
         }
 
         private void SendOpposite(Account target, Order original, OrderAction action, OrderType contraType,
@@ -436,7 +501,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         public bool CreateOpposite { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Contraria con el ATM del Chart Trader", Description = "Activo: la orden contraria se envía con la estrategia ATM seleccionada en el Chart Trader de este gráfico. Si no hay ninguna seleccionada, se envía sin ATM.", Order = 5, GroupName = "Parámetros")]
+        [Display(Name = "Contraria con el ATM del Chart Trader", Description = "Activo: la orden contraria se envía con la estrategia ATM seleccionada en el Chart Trader del gráfico que tiene elegida la cuenta destino. Si no hay gráfico con esa cuenta o no tiene ATM seleccionado, se envía sin ATM.", Order = 5, GroupName = "Parámetros")]
         public bool UseChartTraderAtm { get; set; }
         #endregion
     }
